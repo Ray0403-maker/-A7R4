@@ -19,9 +19,10 @@ Controls:
   R reset  S screenshot  +/- conf  Q quit
 """
 
-import cv2, numpy as np, argparse, time, os, csv
+import cv2, numpy as np, argparse, time, os, csv, math
 from pathlib import Path
 from collections import deque, defaultdict
+from scipy.optimize import linear_sum_assignment
 
 try:
     from adaptive_kalman_v3 import AKFConfig
@@ -73,6 +74,58 @@ def find_camera():
         c = open_camera(i)
         if c: print(f"[Camera] index {i}"); return c
     return None
+
+
+# ─────────────────────────────────────────────────────
+# Hungarian Matching (Phase 1 v6 升級)
+# ─────────────────────────────────────────────────────
+
+def robust_foot_matching(pred_ankles, obs_foot_1, obs_foot_2, img_h):
+    """
+    用匈牙利演算法重新配對左右腳，根除 YOLO 標籤錯亂。
+    
+    pred_ankles: dict {"L": (x,y), "R": (x,y)} 或 None（初期無預測）
+    obs_foot_1, obs_foot_2: (x, y, conf) YOLO 原始輸出
+    img_h: 影像高度（用於計算動態閾值）
+    
+    回傳: (matched_L, matched_R) 或 (None, None)（異常情況）
+    """
+    if pred_ankles is None:
+        # 初期無預測：直接用 YOLO 標籤，但記錄較大信心度的為 L
+        return (obs_foot_1[:2], obs_foot_2[:2])
+    
+    pred_L = pred_ankles.get("L")
+    pred_R = pred_ankles.get("R")
+    
+    if pred_L is None or pred_R is None:
+        return (obs_foot_1[:2], obs_foot_2[:2])
+    
+    # 建立 2x2 成本矩陣（歐氏距離）
+    cost = np.zeros((2, 2), dtype=np.float32)
+    preds = [pred_L, pred_R]  # [0]=L, [1]=R
+    obses = [obs_foot_1, obs_foot_2]
+    
+    for i in range(2):
+        for j in range(2):
+            cost[i, j] = math.hypot(preds[i][0] - obses[j][0],
+                                     preds[i][1] - obses[j][1])
+    
+    # 匈牙利演算法
+    row_ind, col_ind = linear_sum_assignment(cost)
+    
+    matched_L = obses[col_ind[0]][:2]
+    matched_R = obses[col_ind[1]][:2]
+    
+    # 異常防護：雙腳距離異常小（重疊）時進入盲算
+    dist = math.hypot(matched_L[0] - matched_R[0],
+                      matched_L[1] - matched_R[1])
+    threshold = img_h * 0.03  # 動態閾值 ~3% 畫面高度
+    
+    if dist < threshold:
+        # 雙腳重疊，無法可靠配對→回傳 None 讓系統進入純預測
+        return None, None
+    
+    return matched_L, matched_R
 
 
 # ─────────────────────────────────────────────────────
@@ -198,7 +251,8 @@ def detect(camera_index, save_csv_flag):
         csv_w.writerow(["ts","track_id","side","x","y","conf","source"])
 
     print(f"\n=== Foot Detector v5 [{tag}] ===")
-    print("  K bio  A arms  D debug  T trail  B/b  C/c  R  S  Q\n")
+    print("  K bio  A arms  D debug  T trail  B/b  C/c  R  S  Q")
+    print("  P: toggle auto-capture (5s interval)\n")
 
     conf_th     = CONF_THRESHOLD
     alpha, beta = 1.4, 40
@@ -209,7 +263,15 @@ def detect(camera_index, save_csv_flag):
     track_on    = True   # [Bug-3 修正] 使用 ByteTrack 穩定 ID
     ALPHA_DEF, BETA_DEF = 1.4, 40
 
+    # --- 新增：自動擷取控制變數 ---
+    auto_capture_on = False       # 預設為關閉，避免硬碟塞滿
+    auto_capture_interval = 5.0   # 每隔 5 秒擷取一次
+    last_capture_time = time.time()
+    capture_flash_timer = 0       # 用來在畫面上顯示「閃爍提示」的計時器
+    # --------------------------------
+
     trails = defaultdict(lambda: deque(maxlen=TRAIL_LEN))
+    ankle_predictor = {}  # [Phase 1] 存儲每個 person_id 的上一次預測位置，用於匈牙利配對
     fps_buf = []; frame_id = 0; black_n = 0
 
     while True:
@@ -259,9 +321,42 @@ def detect(camera_index, save_csv_flag):
                     draw_skeleton(disp, kpts_np, sx_s, sy_s,
                                   show_arms=show_arms, conf_th=conf_th)
 
+                    # ⭐️ [Phase 1] 匈牙利配對：根治 ID Swap
+                    if bio_on and bio_tracker is not None:
+                        # 提取 YOLO 原始左右腳（可能標籤錯亂）
+                        l_ank = kpts_np[15]  # L_ankle index in COCO
+                        r_ank = kpts_np[16]  # R_ankle index in COCO
+                        
+                        # 執行配對（根據上一幀卡爾曼預測）
+                        pred_ankles = ankle_predictor.get(pid)
+                        matched_L, matched_R = robust_foot_matching(
+                            pred_ankles,
+                            (float(l_ank[0]), float(l_ank[1]), float(l_ank[2])),
+                            (float(r_ank[0]), float(r_ank[1]), float(r_ank[2])),
+                            h
+                        )
+                        
+                        # 異常防護：雙腳重疊時進入盲算
+                        if matched_L is not None and matched_R is not None:
+                            # 修正 kpts_np 的左右腳位置
+                            kpts_np_corrected = kpts_np.copy()
+                            kpts_np_corrected[15] = [matched_L[0], matched_L[1], l_ank[2]]
+                            kpts_np_corrected[16] = [matched_R[0], matched_R[1], r_ank[2]]
+                        else:
+                            # 雙腳重疊，保持原始 YOLO 結果
+                            kpts_np_corrected = kpts_np
+                    else:
+                        kpts_np_corrected = kpts_np
+
                     if bio_on and bio_tracker is not None:
                         # [Bug-4 修正] 傳 frame_h 讓 bio_fusion 算 norm_y
-                        estimates = bio_tracker.process_person(pid, kpts_np, h, w)
+                        estimates = bio_tracker.process_person(pid, kpts_np_corrected, h, w)
+
+                        # 🔄 [Phase 1] 更新預測位置字典（用於下一幀配對）
+                        ankle_predictor[pid] = {
+                            "L": (estimates["L"].x, estimates["L"].y) if estimates["L"].confidence > 0.1 else None,
+                            "R": (estimates["R"].x, estimates["R"].y) if estimates["R"].confidence > 0.1 else None,
+                        }
 
                         for side, est in estimates.items():
                             if est.confidence < 0.05: continue
@@ -273,7 +368,7 @@ def detect(camera_index, save_csv_flag):
                             if trail_on: draw_trail(disp, trails[key], col)
                             draw_ankle_estimate(
                                 disp, est, pid, side, sx_s, sy_s, debug_on,
-                                kpts_np if debug_on else None, w, h)
+                                kpts_np_corrected if debug_on else None, w, h)
                             if csv_w:
                                 csv_w.writerow([f"{time.time():.3f}", pid, side,
                                     f"{est.x:.1f}", f"{est.y:.1f}",
@@ -327,6 +422,35 @@ def detect(camera_index, save_csv_flag):
 
         draw_hud(disp, feet, fps, conf_th, alpha, beta,
                  bio_on, show_arms, debug_on, track_on, tag, dw, dh)
+
+        # --- 新增：定時自動擷取邏輯 ---
+        current_time = time.time()
+        
+        # 處理畫面閃爍提示 (讓文字顯示 0.5 秒)
+        if current_time - capture_flash_timer < 0.5:
+            cv2.putText(disp, "[AUTO CAPTURED]", (30, 80), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+        if auto_capture_on:
+            # 可以在畫面上顯示倒數計時
+            countdown = max(0, auto_capture_interval - (current_time - last_capture_time))
+            cv2.putText(disp, f"Auto Save in: {countdown:.1f}s", (30, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            if current_time - last_capture_time >= auto_capture_interval:
+                # 建立檔名 (使用時間戳記避免覆蓋)
+                timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"test_capture_{timestamp_str}.jpg"
+                
+                # 儲存圖片
+                cv2.imwrite(filename, disp)
+                print(f"[Auto] 已自動擷取測試畫面並存檔：{filename}")
+                
+                # 重置計時器與觸發閃爍提示
+                last_capture_time = current_time
+                capture_flash_timer = current_time
+        # --------------------------------
+
         cv2.imshow("MIVR-CEIQ Foot Detector v5", disp)
 
         key = cv2.waitKey(1) & 0xFF
@@ -356,6 +480,12 @@ def detect(camera_index, save_csv_flag):
             if bio_tracker: bio_tracker.reset_all()
             for t in trails.values(): t.clear()
             print("  Reset all")
+        # --- 新增：切換自動擷取功能 ---
+        elif key in (ord('p'), ord('P')):
+            auto_capture_on = not auto_capture_on
+            last_capture_time = time.time() # 開啟時重置計時器
+            print(f"  Auto Capture: {'ON (5s interval)' if auto_capture_on else 'OFF'}")
+        # --------------------------------
         frame_id += 1
 
     cap.release(); cv2.destroyAllWindows()

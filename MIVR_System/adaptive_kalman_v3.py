@@ -286,6 +286,10 @@ class AdaptiveKalmanPoint:
         self._innov_buf: deque = deque(maxlen=self.cfg.innovation_window)
         self._last_smooth: Optional[Tuple[float, float]] = None
 
+        # [Phase 3 新增] 零延遲起步檢測用的 innovation 歷史
+        self._innovation_history: deque = deque(maxlen=3)
+        self._init_frame_count: int = 0  # 前 5 幀禁用零延遲判定，確保初期安定
+
         # 量測殘差歷史（資料驅動 R，零相機假設）
         self._residual_buf: deque = deque(maxlen=self.cfg.r_residual_window)
 
@@ -460,11 +464,47 @@ class AdaptiveKalmanPoint:
                     raw_dist < self.cfg.still_threshold * 1.5)
         self.is_still = is_still
 
+        # ⭐️ [Phase 3] 零延遲起步檢測（Innovation 監控）
+        self._init_frame_count += 1
+        is_sudden_move = False
+        if self._init_frame_count > 5:  # 初期 5 幀禁用此檢查
+            # 用卡爾曼預測值計算 innovation
+            pred_x = float(self._kf.statePre[0][0])
+            pred_y = float(self._kf.statePre[1][0])
+            dx = raw_x - pred_x
+            dy = raw_y - pred_y
+            
+            self._innovation_history.append((dx, dy))
+            
+            # 檢測突然移動：連續兩幀的 innovation 幅度大且方向一致
+            if len(self._innovation_history) >= 2:
+                prev_dx, prev_dy = self._innovation_history[-2]
+                curr_dx, curr_dy = self._innovation_history[-1]
+                
+                # 計算幅度
+                mag_curr = np.sqrt(curr_dx**2 + curr_dy**2)
+                mag_prev = np.sqrt(prev_dx**2 + prev_dy**2)
+                
+                # 動態閾值：相對於影像高度（~3% 時觸發）
+                threshold = self.cfg.cf_cutoff_still * 5.0  # 約 5px 起步觸發
+                
+                # 內積 > 0 表示方向相同
+                dot_product = prev_dx*curr_dx + prev_dy*curr_dy
+                
+                if (mag_curr > threshold and 
+                    mag_prev > threshold * 0.8 and  
+                    dot_product > 0):  # 同方向
+                    is_sudden_move = True
+
         # ── Level 1：中位數（靜止去跳點，移動直通）──
         m_x = self._med_x.filter(raw_x, is_still)
         m_y = self._med_y.filter(raw_y, is_still)
 
         # ── Level 2：動態 EWMA（去高頻）─────────────
+        # [Phase 3] 如果偵測到突然移動，清除 EWMA 歷史以實現零延遲
+        if is_sudden_move:
+            self._ema_x._prev = m_x
+            self._ema_y._prev = m_y
         e_x = self._ema_x.filter(m_x, is_still)
         e_y = self._ema_y.filter(m_y, is_still)
 
@@ -474,6 +514,10 @@ class AdaptiveKalmanPoint:
 
         # ── 自適應 Q ──────────────────────────────────
         q = self._compute_q(f_x, f_y)
+        # [Phase 3] 零延遲起步時調大 Q，讓卡爾曼更信任觀測值
+        if is_sudden_move:
+            q = min(q * 3.0, self.cfg.q_max)  # 提升但不超過上限
+        self.current_q = q
         self.current_q = q
 
         self._set_transition(self._kf, dt)

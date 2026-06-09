@@ -71,16 +71,24 @@ CONF_LOW     = 0.25   # 低信心但仍參考
 
 class GaitRhythmTracker:
     """
-    追蹤手腕的垂直位移節律，推算腳步週期。
-    生物力學：手臂擺動與腳步呈 1:1 對側協調。
-    右手腕往前（y 減小）→ 左腳應在前方（y 也減小）
+    [Phase 2 升級] 追蹤身體中心線的垂直位移節律，推算腳步週期。
+    
+    優先級邏輯：
+      1. Nose（鼻子）→ 最穩定，即使手部被遮擋也有
+      2. Pelvis Center（骨盆中點）→ 備選，當鼻子無法用時
+      3. Torso Center（軀幹中點）→ 最後備選
+    
+    相比舊版（手腕）的優勢：
+      - 手插口袋或滑手機時仍能追蹤步態
+      - 頭部振盪比手臂更規律
+      - 適應更多姿勢變化
     """
 
     def __init__(self, buf_len: int = 60):
-        # 手腕 y 座標歷史（正規化，0~1）
-        self._l_wrist_y: deque = deque(maxlen=buf_len)
-        self._r_wrist_y: deque = deque(maxlen=buf_len)
+        # 中心線 y 座標歷史（pixel）
+        self._center_y: deque = deque(maxlen=buf_len)
         self._timestamps: deque = deque(maxlen=buf_len)
+        self._history_source: deque = deque(maxlen=buf_len)  # 記錄數據來源
 
         # 估算的步頻（Hz）
         self.stride_freq: float = 0.0
@@ -89,35 +97,66 @@ class GaitRhythmTracker:
         self.l_ankle_phase: float = 0.0
         self.r_ankle_phase: float = np.pi   # 對側，差半個週期
 
-        # 手腕擺動幅度（像素，用來判斷是否在行走）
-        self.wrist_amplitude: float = 0.0
+        # 中心線振盪幅度（像素，用來判斷是否在行走）
+        self.center_amplitude: float = 0.0
         self.is_walking: bool = False
-        self.WALK_AMPLITUDE_THRESH = 8.0    # 像素
+        self.WALK_AMPLITUDE_THRESH = 8.0    # 像素（~3% 畫面高度 in 720p）
 
         self._last_update = time.time()
 
     def update(self, kpts: np.ndarray, img_h: int):
-        """kpts: shape (17, 3) [x, y, conf]"""
+        """[Phase 2 VR版] 更新重心位置，推算步態
+        
+        kpts: shape (17, 3) [x, y, conf] from YOLOv8-Pose
+        """
         now = time.time()
         self._timestamps.append(now)
 
-        lw_conf = float(kpts[KP["l_wrist"]][2])
-        rw_conf = float(kpts[KP["r_wrist"]][2])
+        # ⭐️ 優先級 1：正面/背面 → 左右髖中點（最準確的重心位置）
+        l_hip = kpts[KP["l_hip"]]
+        r_hip = kpts[KP["r_hip"]]
+        l_hip_conf = float(l_hip[2])
+        r_hip_conf = float(r_hip[2])
+        
+        center_y = None
+        source = "none"
+        
+        if l_hip_conf > CONF_VISIBLE and r_hip_conf > CONF_VISIBLE:
+            # 正面/背面：取左右髖中點（最準確的 COM）
+            l_hip_y = float(l_hip[1])
+            r_hip_y = float(r_hip[1])
+            center_y = (l_hip_y + r_hip_y) / 2.0
+            source = "pelvis_center"
+        
+        # ⭐️ 優先級 2：側身 → 單邊髖關節（當只能看到一邊時）
+        elif l_hip_conf > CONF_VISIBLE:
+            center_y = float(l_hip[1])
+            source = "l_hip_only"
+        elif r_hip_conf > CONF_VISIBLE:
+            center_y = float(r_hip[1])
+            source = "r_hip_only"
+        
+        # 記錄有效的重心位置
+        if center_y is not None:
+            self._center_y.append(center_y)
+            self._history_source.append(source)
+            self.last_source = source
+        
+        # 計算振盪幅度（用來判斷是否在行走）
+        if len(self._center_y) >= 10:
+            arr = np.array(list(self._center_y)[-20:])
+            self.com_amplitude = float(arr.max() - arr.min())
+            self.is_walking = self.com_amplitude > self.WALK_AMPLITUDE_THRESH
 
-        if lw_conf > CONF_VISIBLE:
-            self._l_wrist_y.append(float(kpts[KP["l_wrist"]][1]))
-        if rw_conf > CONF_VISIBLE:
-            self._r_wrist_y.append(float(kpts[KP["r_wrist"]][1]))
-
-        # 計算擺動幅度
-        if len(self._r_wrist_y) >= 10:
-            arr = np.array(list(self._r_wrist_y)[-20:])
-            self.wrist_amplitude = float(arr.max() - arr.min())
-            self.is_walking = self.wrist_amplitude > self.WALK_AMPLITUDE_THRESH
-
-        # 估算步頻（找手腕 y 的過零點頻率）
-        if len(self._r_wrist_y) >= 30:
+        # 估算步頻（找重心 y 的週期）
+        if len(self._center_y) >= 30:
             self._estimate_stride_freq()
+        
+        # 計算步態信息可信度
+        if self.is_walking and self.stride_freq > 0.5:
+            self.confidence = min(1.0, self.com_amplitude / 30.0)
+        else:
+            self.confidence = 0.0
 
         # 更新相位
         if self.stride_freq > 0.5:
@@ -129,21 +168,24 @@ class GaitRhythmTracker:
         self._last_update = now
 
     def _estimate_stride_freq(self):
-        """利用自相關估算週期"""
-        arr = np.array(list(self._r_wrist_y))
+        """[Phase 2 VR版] 利用自相關估算步頻（用重心數據）
+        
+        原理：重心的 Y 軸振盪形成完美正弦波，自相關可提取其週期
+        """
+        arr = np.array(list(self._center_y))
         arr = arr - arr.mean()
         n = len(arr)
         if n < 20:
             return
 
-        # 自相關
+        # 自相關計算
         corr = np.correlate(arr, arr, mode='full')[n-1:]
         corr = corr[1:n//2]   # 去掉零延遲，只看前半段
 
         if len(corr) < 5:
             return
 
-        # 找第一個局部最大值（= 週期）
+        # 找第一個局部最大值（代表步頻週期）
         peaks = []
         for i in range(1, len(corr)-1):
             if corr[i] > corr[i-1] and corr[i] > corr[i+1] and corr[i] > 0:
@@ -161,13 +203,6 @@ class GaitRhythmTracker:
     def get_ankle_phase_offset(self, side: str) -> float:
         """回傳指定腳的當前相位（用於步態輔助預測）"""
         return self.l_ankle_phase if side == "L" else self.r_ankle_phase
-
-    @property
-    def confidence(self) -> float:
-        """步態追蹤的可信度（0~1）"""
-        if not self.is_walking or self.stride_freq < 0.5:
-            return 0.0
-        return min(1.0, self.wrist_amplitude / 30.0)
 
 
 # ─────────────────────────────────────────────────────
@@ -635,7 +670,7 @@ def draw_gait_indicator(disp: np.ndarray,
 
     info = (f"P{person_id} "
             f"{gait.stride_freq:.1f}Hz "
-            f"amp:{gait.wrist_amplitude:.0f}px "
+            f"amp:{gait.com_amplitude:.0f}px "
             f"c:{gait.confidence:.2f}")
     cv2.putText(disp, info, (x + 24, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 180, 100), 1)
